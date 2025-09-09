@@ -1,179 +1,262 @@
 import os
+import traceback
+from datetime import datetime
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-from dotenv import load_dotenv  # 👈 new
+from gspread_formatting import (
+    CellFormat, TextFormat, Borders, Border, format_cell_range
+)
 
-# Load .env file automatically
 load_dotenv()
-
 app = Flask(__name__)
 
 # ================================
-# 🔹 Google Sheets Setup
+# Config
 # ================================
-CRED_FILE = os.getenv("GOOGLE_SHEETS_CRED")  # set this in your environment
-if not CRED_FILE:
-    raise ValueError("❌ GOOGLE_SHEETS_CRED environment variable not set!")
+CRED_PATH = os.getenv("GOOGLE_SHEETS_CRED")  # absolute path to your service account .json
+if not CRED_PATH:
+    raise ValueError("GOOGLE_SHEETS_CRED environment variable is not set")
 
-SPREADSHEET_NAME = "Expense Tracker"
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "Expense Tracker")  # change if needed
 
-scope = ["https://spreadsheets.google.com/feeds",
-         "https://www.googleapis.com/auth/drive"]
-
-creds = ServiceAccountCredentials.from_json_keyfile_name(CRED_FILE, scope)
-client = gspread.authorize(creds)
-
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
 
 # ================================
-# 🔹 Helper Functions
+# Google Sheets helpers
 # ================================
-def get_monthly_sheet(date_obj=None, month_year=None):
+def get_client():
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CRED_PATH, SCOPES)
+    return gspread.authorize(creds)
+
+def get_spreadsheet():
+    client = get_client()
+    return client.open(SPREADSHEET_NAME)
+
+def month_title_from_date(dt: datetime) -> str:
+    return dt.strftime("%B %Y")  # e.g., "September 2025"
+
+def month_title_from_param(month_param: str | None) -> str:
+    # month_param format: "YYYY-MM" or None (use current month)
+    if month_param:
+        dt = datetime.strptime(month_param, "%Y-%m")
+    else:
+        dt = datetime.now()
+    return month_title_from_date(dt)
+
+def ensure_header(ws):
     """
-    Get or create the sheet for the given month.
-    - If month_year is provided (format YYYY-MM), use that.
-    - Otherwise fallback to the date_obj or today.
+    Ensure the header row exists and is correctly formatted.
+    Safe even if the sheet was just created.
     """
-    ss = client.open(SPREADSHEET_NAME)
+    # Read first row (could be empty)
+    values = ws.get_all_values()
+    header_ok = False
+    if values:
+        first_row = values[0] if len(values) >= 1 else []
+        # Normalize missing columns
+        first_row += [""] * (4 - len(first_row))
+        if first_row[:4] == ["Date", "Category", "Amount", "Note"]:
+            header_ok = True
 
-    if month_year:
-        # Convert YYYY-MM -> datetime
-        date_obj = datetime.strptime(month_year, "%Y-%m")
-    elif not date_obj:
-        date_obj = datetime.now()
+    if not header_ok:
+        # Clear A1:D1 then set header
+        ws.update("A1:D1", [["Date", "Category", "Amount", "Note"]])
 
-    month_name = date_obj.strftime("%B %Y")  # e.g. "September 2025"
-
+    # Apply formatting (bold + fontSize=12 + bottom border)
     try:
-        sheet = ss.worksheet(month_name)
-    except gspread.WorksheetNotFound:
-        # Create if not exists
-        sheet = ss.add_worksheet(title=month_name, rows="1000", cols="10")
-        sheet.append_row(["Date", "Category", "Amount", "Note"])  # headers
-    return sheet
+        header_fmt = CellFormat(
+            textFormat=TextFormat(bold=True, fontSize=11, fontFamily="Comic Sans MS"),
+            borders=Borders(bottom=Border("SOLID"))
+        )
+        format_cell_range(ws, "A1:D1", header_fmt)
+    except Exception:
+        # Don't break if formatting fails
+        traceback.print_exc()
 
+def get_or_create_worksheet(month_title: str):
+    ss = get_spreadsheet()
+    try:
+        ws = ss.worksheet(month_title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=month_title, rows="1000", cols="10")
+    # Always ensure header exists & is formatted
+    ensure_header(ws)
+    return ws
 
-def insert_expense(sheet, date_str, category, amount, note):
+# ================================
+# Core insert/update helpers
+# ================================
+def parse_amount(val):
+    try:
+        return float(val)
+    except Exception:
+        return 0.0
+
+def clean_str(s):
+    return (s or "").strip()
+
+def add_or_update_expense(date_str, category, amount, note):
     """
-    Insert an expense row at the correct chronological position.
+    - Reject future dates
+    - If exact duplicate exists (Date, Category, Amount, Note) -> error
+    - Else if same Date+Category exists -> update that row's Amount & Note
+    - Else insert in correct chronological order
     """
-    all_values = sheet.get_all_values()
-    if len(all_values) <= 1:
-        # only header exists
-        sheet.append_row([date_str, category, amount, note])
-        return
+    # Parse & validate date
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    if date_obj.date() > datetime.today().date():
+        return {"status": "error", "message": "Future dates are not allowed. Use today or past dates."}
 
-    inserted = False
-    for i in range(1, len(all_values)):
+    month_title = month_title_from_date(date_obj)
+    ws = get_or_create_worksheet(month_title)
+
+    # Normalize fields
+    category = clean_str(category)
+    note = clean_str(note)
+    amount = parse_amount(amount)
+
+    # Fetch entire sheet to:
+    # - check duplicates
+    # - detect same date+category (for update)
+    # - compute chronological insert index
+    all_values = ws.get_all_values()  # includes header if present
+    if not all_values:
+        # Extremely fresh sheet; ensure header then append
+        ensure_header(ws)
+        ws.append_row([date_str, category, amount, note])
+        return {"status": "ok", "action": "Expense added successfully!"}
+
+    # Trackers
+    duplicate_found = False
+    update_row_index = None  # 1-based in Sheets
+    insert_index = None
+
+    # Iterate rows starting from row 2 (skip header)
+    for idx in range(1, len(all_values)):
+        row = all_values[idx] if idx < len(all_values) else []
+        # Defensive: pad row to 4 cols
+        row += [""] * (4 - len(row))
+
+        row_date = clean_str(row[0])
+        row_category = clean_str(row[1])
+        row_amount = parse_amount(row[2])
+        row_note = clean_str(row[3])
+
+        # Compute chronological insertion position
         try:
-            existing_date = datetime.strptime(all_values[i][0], "%Y-%m-%d")
-            new_date = datetime.strptime(date_str, "%Y-%m-%d")
-        except:
-            continue
+            existing_dt = datetime.strptime(row_date, "%Y-%m-%d")
+            if insert_index is None and date_obj < existing_dt:
+                # Insert BEFORE this row; +1 because Sheets is 1-based
+                insert_index = idx + 1
+        except Exception:
+            # If date parsing fails, ignore for sort purposes
+            pass
 
-        if new_date < existing_date:
-            sheet.insert_row([date_str, category, amount, note], index=i+1)
-            inserted = True
+        # Exact duplicate?
+        if (row_date == date_str
+            and row_category.lower() == category.lower()
+            and row_amount == amount
+            and row_note == note):
+            duplicate_found = True
             break
 
-    if not inserted:
-        sheet.append_row([date_str, category, amount, note])
+        # Same Date + Category (case-insensitive)?
+        if update_row_index is None and (row_date == date_str and row_category.lower() == category.lower()):
+            update_row_index = idx + 1  # 1-based index for Sheets
 
+    if duplicate_found:
+        return {"status": "error", "message": "Duplicate expense found. Entry not added."}
+
+    if update_row_index:
+        # Update Amount & Note on the existing row
+        ws.update_cell(update_row_index, 3, amount)  # Amount (col C)
+        ws.update_cell(update_row_index, 4, note)    # Note (col D)
+        return {"status": "ok", "action": "Updated the existing expense!"}
+
+    # Insert new row in chronological order
+    new_row = [date_str, category, amount, note]
+    if insert_index:
+        ws.insert_row(new_row, insert_index)
+        return {"status": "ok", "action": "Inserted the new expense!"}
+    else:
+        ws.append_row(new_row)
+        return {"status": "ok", "action": "Expense added successfully!"}
 
 # ================================
-# 🔹 API Routes
+# Routes
 # ================================
-
 @app.route("/add_expense", methods=["POST"])
-def api_add_expense():
-    """
-    Add a new expense entry.
-    JSON body:
-    {
-        "date": "2025-09-05",  # optional, default today
-        "category": "Food",
-        "amount": 250,
-        "note": "Dinner"
-    }
-    """
+def add_expense():
     try:
-        data = request.json
-        date_str = data.get("date")
-        if not date_str:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-
-        category = data.get("category", "Other")
-        amount = float(data.get("amount", 0))
+        data = request.get_json(force=True) or {}
+        date_str = clean_str(data.get("date")) or datetime.today().strftime("%Y-%m-%d")
+        category = data.get("category", "Misc")
+        amount = data.get("amount", 0)
         note = data.get("note", "")
 
-        # Get monthly sheet and insert
-        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-        sheet = get_monthly_sheet(date_obj=date_obj)
-        insert_expense(sheet, date_str, category, amount, note)
+        result = add_or_update_expense(date_str, category, amount, note)
+        return jsonify(result), (200 if result.get("status") == "ok" else 400)
 
-        return jsonify({"status": "ok", "message": "Expense added successfully!"})
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
-
 
 @app.route("/get_summary", methods=["GET"])
-def api_get_summary():
-    """
-    Category-wise summary for a given month.
-    Pass ?month=YYYY-MM in the query string.
-    """
+def get_summary():
     try:
-        month_param = request.args.get("month")
-        sheet = get_monthly_sheet(month_year=month_param)
-        records = sheet.get_all_records()
+        month_param = request.args.get("month")  # YYYY-MM (optional; defaults to current)
+        month_title = month_title_from_param(month_param)
+
+        ws = get_or_create_worksheet(month_title)
+        records = ws.get_all_records()  # uses header row keys
 
         summary = {}
-        for row in records:
-            category = row.get("Category", "Other")
-            try:
-                amount = float(row.get("Amount", 0))
-            except:
-                amount = 0
-            summary[category] = summary.get(category, 0) + amount
+        for r in records:
+            cat = clean_str(r.get("Category"))
+            amt = parse_amount(r.get("Amount"))
+            summary[cat] = summary.get(cat, 0.0) + amt
 
         return jsonify({"status": "ok", "summary": summary})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
 
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/get_daily_summary", methods=["GET"])
-def api_get_daily_summary():
-    """
-    Daily spend summary for a given month.
-    Pass ?month=YYYY-MM in the query string.
-    """
+def get_daily_summary():
     try:
-        month_param = request.args.get("month")
-        sheet = get_monthly_sheet(month_year=month_param)
-        records = sheet.get_all_records()
+        month_param = request.args.get("month")  # YYYY-MM (optional; defaults to current)
+        month_title = month_title_from_param(month_param)
 
-        daily_summary = {}
-        for row in records:
-            date_str = row.get("Date")
+        ws = get_or_create_worksheet(month_title)
+        records = ws.get_all_records()
+
+        daily = {}
+        for r in records:
+            date_str = clean_str(r.get("Date"))
             try:
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                day = date_obj.strftime("%d")  # e.g. "05"
-                amount = float(row.get("Amount", 0))
-            except:
+                d = datetime.strptime(date_str, "%Y-%m-%d")
+                day_key = d.strftime("%d")  # "01".."31"
+                amt = parse_amount(r.get("Amount"))
+                daily[day_key] = daily.get(day_key, 0.0) + amt
+            except Exception:
                 continue
 
-            daily_summary[day] = daily_summary.get(day, 0) + amount
+        # Sort by numeric day
+        daily_sorted = {k: daily[k] for k in sorted(daily.keys(), key=lambda x: int(x))}
+        return jsonify({"status": "ok", "daily_summary": daily_sorted})
 
-        sorted_summary = dict(sorted(daily_summary.items(), key=lambda x: int(x[0])))
-
-        return jsonify({"status": "ok", "daily_summary": sorted_summary})
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 # ================================
-# 🔹 Run the Flask App
+# App
 # ================================
 if __name__ == "__main__":
     app.run(debug=True)
